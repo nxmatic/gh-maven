@@ -1,19 +1,18 @@
-#!/usr/bin/env -S bash -e -o pipefail
-
+#!/usr/bin/env -S bash -e -o pipefail 
 PKG_TYPE="maven"
 SCRIPT="$(realpath "$0")"
 
 function help()
 {
-    cat <<EOF
+  cat <<EOF
 Manage packages of type container posted to ghcr.io
 Usage:
   gh maven <command>
 Commands:
   packages       List packages of type maven
   versions       List versions of a maven package
-  clean          Clean versions a maven package
   delete         Delete a maven package
+  deleteVersion  Delete a maven package version
   browse         Browse versions of a maven package with fzf
 
 Flags:
@@ -23,7 +22,7 @@ EOF
 
 function help_version()
 {
-    cat <<EOF
+  cat <<EOF
 List versions of a maven package
 Usage:
   gh maven version <package name>
@@ -41,7 +40,7 @@ ctrl-x: Delete selected versions
 
 function help_browse()
 {
-    cat <<EOF
+  cat <<EOF
 Browse with fzf through verion of a package
 Usage:
   gh maven browse <package name>
@@ -54,7 +53,7 @@ EOF
 
 function help_clean()
 {
-    cat <<EOF
+  cat <<EOF
 Clean a package version
 Usage:
   gh maven clean <package name> [<package version id>] [flags]
@@ -64,16 +63,16 @@ Flags:
 
 Examples:
   # Remove version 1234 of my-package
-  gh maven clean my-package 1234
+  gh maven deleteVersion group artifact 1234
 
   # Remove all versions of my-package
-  gh maven clean my-package
+  gh maven delete group artifact
 EOF
 }
 
 function help_delete()
 {
-    cat <<EOF
+  cat <<EOF
 Delete a package
 Usage:
   gh maven delete <package name>
@@ -91,236 +90,334 @@ HDR_ACCEPT='Accept: application/vnd.github+json'
 HDR_API_VERSION='X-GitHub-Api-Version: 2022-11-28'
 
 function gh:api() {
-  gh api -H "${HDR_ACCEPT}" -H "${HDR_API_VERSION}" "$@" | 
-    yq -p json -o yaml eval .
+  local baseUrl=""
+  local method="GET"
+  local -a options=()
+  local -a params=()
+  local query=""
+
+  # Separate options and parameters
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --method=*)
+        method="${1#*=}"
+        options+=("$1")
+        shift
+        ;;
+      --*)
+        options+=("$1")
+        shift
+        ;;
+      *)
+        if [[ -z "$baseUrl" ]]; then
+          baseUrl="$1"
+        else
+          params+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # Construct the query string from the parameters array
+  for param in "${params[@]}"; do
+    query+="${query:+&}${param}"
+  done
+
+  # Add '?' only if there are query parameters
+  if [ -n "$query" ]; then
+    query="?$query"
+  fi
+
+  # Fetch the response from the GitHub API
+  if [[ "$method" == "GET" ]]; then
+    gh api --paginate -H "${HDR_ACCEPT}" -H "${HDR_API_VERSION}" "${options[@]}" "${baseUrl}${query}" |
+      yq -P
+  else
+    gh api -H "${HDR_ACCEPT}" -H "${HDR_API_VERSION}" "${options[@]}" "${baseUrl}${query}" |
+      yq -P
+  fi
 }
 
 function gh:api:login()
 {
-    gh:api user | 
-      yq eval '.login'
+  gh:api user | 
+    yq eval '.login'
 }
 
 function gh:api:delete()
 {
-    gh:api --method=DELETE $*
-}
-
-function gh:api:list() {
-  local url=$1
-
-  local page
-  local response
-
-  for ((page=1; ; page++)); do
-    response=$( gh:api "$url&page=$page" )
-    if [ "$( echo "$response" | yq '. | length' )" -eq 0 ]; then
-      break
-    fi
-    cat <<<"$response"
-  done
+  gh:api --method=DELETE $*
 }
 
 function gh:api:packages:delete()
 {
-    local username
-    local group
-    local artifact
+  local username
+  local group
+  local artifact
 
-    username="$1"
-    group="${2:-*}"
-    artifact="${3:-*}"
+  username="$1"
+  group="${2:-%}"
+  artifact="${3:-%}"
 
-    exec 3>&1
-    for name in $( gh:api:packages:list "$group" "$artifact" | tee >(cat >&3) | yq eval  '.[] | .name' ); do
-      gh:api:delete "/user/packages/maven/${name}"
-    done
-    exec 3>&-
+  exec 3>&1
+  for name in $( gh:api:packages "$group" "$artifact" | tee >(cat >&3) | yq eval  '.[] | .name' ); do
+    gh:api:delete "/user/packages/maven/${name}"
+  done
+  exec 3>&-
 }
 
-function gh:api:packages:list()
+function gh:api:packages()
 {
-  local group=${1:-*}
-  local artifact=${2:-*}
+  local group=${1:-%}
+  local artifact=${2:-%}
 
-  gh:api:list \
-    "/user/packages?package_type=$PKG_TYPE" |
-    yq eval "map(select(.name == \"${group}.${artifact}\"))"
+  function toPattern() {
+    local input="$1"
+    input="${input//./\\.}"
+    input="${input//%/.*}"
+    echo "$input"
+  }
+
+  local -a patterns=( )
+  patterns[0]=$( toPattern "$group" )
+  patterns[1]=$( toPattern "$artifact" )
+
+  gh:api \
+    "/user/packages" "package_type=$PKG_TYPE" |
+    yq eval "map(select(.name | test(\"^${patterns[0]}\\.${patterns[1]}$\")))"
 }
 
-function gh:api:packages:versions:list()
-{
-    local pkg_name
-    local query
-    local titles
-    local params
-    local show_pkg_name
+function gh:api:packages:versions() {
+  local name="${1}"
+  local version="${2:-%}"
 
-    show_pkg_name=0
+  local endpoint=""
+  [[ version == "%" ]] &&
+    endpoint="/${version}"
 
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -h|--help)
-                help_version
-                exit 0
-                ;;
-            --show-pkg-name)
-                show_pkg_name=1
-                ;;
-            *)
-                params+="$1"
-                ;;
-        esac
-        shift
-    done
-    eval set -- "${params}"
-    pkg_name="$1"
-
-    if [ ${show_pkg_name} -eq 0 ]; then
-        titles='["ID", "NAME", "LAST UPDATE", "REPOSITORY"]'
-        fields='.id, .name, .updated_at, .url'
-    else
-        titles='["PKG NAME", "ID", "NAME", "LAST UPDATE", "REPOSITORY"]'
-        fields="\"${pkg_name}\", "
-        fields='.id, .name, .updated_at, .url'
-    fi
-    query="(${titles}), (.[] | [${fields}]) | @tsv"
-
-    gh:api:list \
-      "/user/packages/${PKG_TYPE}/${pkg_name}/versions" | \
-      yq "${query}" | \
-      column -ts $'\t'
+  gh:api "/user/packages/${PKG_TYPE}/${name}/versions${endpoint}"
 }
 
 function gh:api:packages:versions:delete()
 {
-    local username="$1"
-    local name="$2"
-    local version="$3"
+  local username="$1"
+  local name="$2"
+  local version="$3"
 
-    gh:api:delete \
-      "/users/${username}/packages/${PKG_TYPE}/${name}/versions/${version}"
+  gh:api:delete \
+    "/users/${username}/packages/${PKG_TYPE}/${name}/versions/${version}"
+}
+
+
+function frontend:args() {
+  local -n args_ref=$1; shift
+  local -n options_ref=$1; shift
+  local -n options_frontend_ref=$1; shift
+
+  # Initialize default values
+  options_frontend_ref['raw']=false
+  options_frontend_ref['show-pkg-name']=false
+
+  for arg in "$@"; do
+    if [[ ${arg} == --* ]]; then
+      local key="${arg#--}"
+      local value
+
+      if [[ ${arg} == *=* ]]; then
+        value="${arg#*=}"
+        key="${key%%=*}"
+      else
+        value="true"
+      fi
+
+      case "$key" in
+        "raw"|"show-pkg-name")
+          options_frontend_ref["$key"]=$value
+          ;;
+        *)
+          options_ref["$key"]=$value
+          ;;
+      esac
+    else
+      args_ref+=("${arg}")
+    fi
+  done
+}
+
+function frontend:output() {
+  local -n options=$1
+
+  ${options["raw"]:-false} &&
+    cat &&
+    return
+
+  local titles
+  local fields
+
+  if ! ${options["show-pkg-name"]:-false}; then
+    titles='["ID", "NAME", "LAST UPDATE", "REPOSITORY"]'
+    fields='.id, .name, .updated_at, .url'
+  else
+    titles='["PKG NAME", "ID", "NAME", "LAST UPDATE", "REPOSITORY"]'
+    fields="\"${pkg_name}\", .id, .name, .updated_at, .url"
+  fi
+
+  local query
+
+  query="(${titles}), (.[] | [${fields}])"
+
+  yq -o=tsv "${query}" |
+    column -ts $'\t'
 }
 
 function browse()
 {
-    local params
-    local titles
-    local fields
-    local pkg_name
+  local params
+  local titles
+  local fields
+  local pkg_name
 
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -h|--help)
-                help_browse
-                exit 0
-                ;;
-            *)
-                break
-                ;;
-        esac
-        shift
-    done
-    pkg_name="$1"
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -h|--help)
+        help_browse
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
+  pkg_name="$1"
 
-    titles='["NAME", "ID"]'
-    fields='[.name, .id]'
-    query="(${titles}), (.[] | ${fields}) | @tsv"
-    export -f gh:api:packages:versions:list
-    export PKG_TYPE
-    export HDR_ACCEPT
-    export HDR_API_VERSION
-    export FZF_DEFAULT_COMMAND="gh:api:packages:versions:list"
+  titles='["NAME", "ID"]'
+  fields='[.name, .id]'
+  query="(${titles}), (.[] | ${fields}) | @tsv"
+  export -f gh:api:packages:versions
+  export PKG_TYPE
+  export HDR_ACCEPT
+  export HDR_API_VERSION
+  export FZF_DEFAULT_COMMAND="gh:api:packages:versions"
 
-    fzf \
-        --bind "ctrl-h:toggle-preview" --preview "echo '${FZF_BROWSE_HELP}'" --preview-window hidden \
-        --bind "ctrl-r:reload#${FZF_DEFAULT_COMMAND}#" \
-        --bind "ctrl-x:execute#echo {} | awk '{print $2}' | xargs ${SCRIPT} clean #" \
-        --bind "ctrl-x:+reload#${FZF_DEFAULT_COMMAND}#" \
-        --preview-window=down,$(echo "${FZF_BROWSE_HELP}" | wc -l) \
-        --color preview-bg:#222222 \
-        --header-lines=1
+  fzf \
+    --bind "ctrl-h:toggle-preview" --preview "echo '${FZF_BROWSE_HELP}'" --preview-window hidden \
+    --bind "ctrl-r:reload#${FZF_DEFAULT_COMMAND}#" \
+    --bind "ctrl-x:execute#echo {} | awk '{print $2}' | xargs ${SCRIPT} clean #" \
+    --bind "ctrl-x:+reload#${FZF_DEFAULT_COMMAND}#" \
+    --preview-window=down,$(echo "${FZF_BROWSE_HELP}" | wc -l) \
+    --color preview-bg:#222222 \
+    --header-lines=1
 }
 
 function packages() {
-  gh:api:packages:list $@
+  local -a args=()
+  local -A options=()
+  local -A frontendOptions=()
+
+  frontend:args args options frontendOptions "$@"
+
+  local group="${args[0]:-%}"
+  local artifact="${args[1]:-%}"
+
+  gh:api:packages "${group}" "${artifact}" |
+    frontend:output frontendOptions
 }
 
 function versions() {
-  gh:api:packages:versions:list $@
+  local -a args=()
+  local -A options=()
+  local -A frontendOptions=()
+
+  frontend:args args options frontendOptions "$@"
+
+  local name="${args[0]:-%}"
+  local version="${options[version]:-%}"
+
+  gh:api:packages:versions "${name}" "${version}" | 
+    frontend:output frontendOptions
 }
 
 function delete()
 {
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -h|--help)
-                help_delete
-                exit 0
-                ;;
-            *)
-	        break
-                ;;
-        esac
-        shift
-    done
+  local -a args=()
+  local -A options=()
+  local -A frontendOptions=()
 
-    local username="$( gh:api:login )"
+  frontend:args args options frontendOptions "$@"
 
-    gh:api:packages:delete "${username}" "${@}"
-  }
+  local username="$( gh:api:login )"
+  local group="${args[0]:-%}"
+  local artifact="${args[1]:-%}"
 
-function clean()
-{
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -h|--help)
-                help_clean
-                exit 0
-                ;;
-            *)
-	        break
-                ;;
-        esac
-        shift
-    done
+  gh:api:packages:delete "${username}" "${group}" "${artifact}" |
+    frontend:output frontendOptions
+}
 
-    local username="$(gh:api:login)"
-    local name="$1"
-    if [ -z "${name}" ]; then
-        echo "Error: Missing package name"
-        help_clean
-        exit 1
-    fi
-    local versions="${@:2}"
-    for id in $( gh:api:packages:versions:list | yq '. | .name' ); do
-      gh:api:packages:versions:delete "${name}" "${id}"
-    done
+function deleteVersion() {
+  local -a args=()
+  local -A options=()
+  local -A frontendOptions=()
+
+  frontend:args args options frontendOptions "$@"
+
+  local username="$( gh:api:login )"
+  local group="${args[0]:-%}"
+  local artifact="${args[1]:-%}"
+  local version="${options[version]:-%}"
+  
+  local metainfo
+
+ 
+  gh:api:packages "${group}" "${artifact}" |
+       yq -o=json -I=0 eval '.[] | { "name": .name, "counter": .version_count } | split_doc' |
+       while IFS= read -r metainfo || [[ -n "$metainfo" ]]; do
+	 if [[ "$metainfo" == "---" ]]; then
+	   continue  # Skip the document separator
+	 fi	 
+	 source <(yq -o=shell eval '.' <<<"${metainfo}" )
+	 isLast=$(( counter == 1 ? 1 : 0 ))
+	 for id in $( gh:api:packages:versions "${name}" "${version}" |
+			yq eval '.[] | .id' ); do
+	   if (( isLast )); then
+	     if [[ "$name" =~ ^(.*)\.(.*)$ ]]; then
+	       gh:api:packages:delete "${username}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+	     else
+	       echo "Error: Unable to parse package name: $name" >&2
+	       exit 1
+	     fi
+	     continue
+	   fi
+	   gh:api:packages:versions:delete "${username}" "${name}" "${id}"
+	 done
+       done |
+       frontend:output frontendOptions
 }
 
 PARAMS=""
 while [ $# -gt 0 ]; do
-    key="$1"
-    case ${key} in
-        -h|--help)
-            help
-            exit 0
-            ;;
-        browse|packages|versions|delete|clean)
-            ACTION="$1"
-            ;;
-        *)
-            PARAMS+="$1"
-            ;;
-    esac
-    shift
-    if [ -n "${ACTION}" ]; then
-        break
-    fi
+  key="$1"
+  case ${key} in
+    -h|--help)
+      help
+      exit 0
+      ;;
+    browse|packages|versions|delete|deleteVersion)
+      ACTION="$1"
+      ;;
+    *)
+      PARAMS+="$1"
+      ;;
+  esac
+  shift
+  if [ -n "${ACTION}" ]; then
+    break
+  fi
 done
 
 case "${ACTION}" in
-   browse|packages|versions|delete|clean)
+  browse|packages|versions|delete|deleteVersion)
     ${ACTION} $@
     ;;
   *)
